@@ -1,0 +1,19 @@
+{
+	"version": "2.0.0",
+	"tasks": [
+		{
+			"label": "Run outfit recommendation app",
+			"type": "shell",
+			"command": "C:\\Users\\SAKSHI\\ecommerce_outfit_rec_system\\venv\\Scripts\\python.exe",
+			"args": [
+				"-m",
+				"streamlit",
+				"run",
+				"app.py",
+				"--server.headless=true"
+			],
+			"isBackground": true,
+			"problemMatcher": []
+		}
+	]
+}
