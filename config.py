@@ -7,13 +7,16 @@ from dataclasses import dataclass
 class RankingWeights:
     """Weights used by deterministic outfit scoring."""
 
-    style: float = 0.20
-    color: float = 0.20
-    occasion: float = 0.15
-    category: float = 0.15
-    formality: float = 0.10
-    season: float = 0.10
+    style: float = 0.12
+    color: float = 0.12
+    occasion: float = 0.10
+    category: float = 0.08
+    formality: float = 0.08
+    season: float = 0.08
     constraints: float = 0.10
+    product_quality: float = 0.10
+    preference_match: float = 0.10
+    outfit_coherence: float = 0.12
 
     def __post_init__(self) -> None:
         values = (
@@ -24,6 +27,9 @@ class RankingWeights:
             self.formality,
             self.season,
             self.constraints,
+            self.product_quality,
+            self.preference_match,
+            self.outfit_coherence,
         )
         if any(value < 0 for value in values):
             raise ValueError("Ranking weights cannot be negative")
@@ -41,6 +47,9 @@ class RankingWeights:
                 self.formality,
                 self.season,
                 self.constraints,
+                self.product_quality,
+                self.preference_match,
+                self.outfit_coherence,
             )
         )
 
@@ -52,7 +61,6 @@ class WorkflowConfig:
     max_candidates_per_category: int = 60
     max_outfit_candidates: int = 100
     max_retries: int = 2
-    default_budget_inr: float = 5000.0
     ranking_weights: RankingWeights = RankingWeights()
     agent_cost_units: float = 1.0
     tool_cost_units: float = 1.0
@@ -65,8 +73,6 @@ class WorkflowConfig:
             raise ValueError("Outfit limit must be positive")
         if self.max_retries < 0:
             raise ValueError("Retry limit cannot be negative")
-        if self.default_budget_inr <= 0:
-            raise ValueError("Default budget must be positive")
         if any(
             value < 0
             for value in (self.agent_cost_units, self.tool_cost_units, self.retry_cost_units)

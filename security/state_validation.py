@@ -5,7 +5,7 @@ from workflow.state import Requirements, WorkflowState
 
 def validate_requirements(requirements: Requirements) -> tuple[bool, list[str]]:
     errors: list[str] = []
-    if requirements.budget_inr <= 0:
+    if requirements.budget_inr is not None and requirements.budget_inr <= 0:
         errors.append("Budget must be positive")
     if not requirements.required_categories:
         errors.append("At least one category is required")

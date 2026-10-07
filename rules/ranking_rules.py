@@ -21,6 +21,7 @@ def rank_outfits(
     return sorted(
         scored,
         key=lambda item: (
+            item[1].eligibility_status != "ELIGIBLE",
             -item[1].overall_score,
             tuple(str(product.get("product_id", "")) for product in item[0]),
         ),

@@ -43,6 +43,26 @@ def test_ranking_is_stable_and_descending() -> None:
     assert ranked[0][1].overall_score >= ranked[1][1].overall_score
 
 
+def test_invalid_outfit_is_ineligible_even_with_high_product_quality() -> None:
+    valid = [
+        product("1", "Top", "Black"),
+        product("2", "Bottom", "White"),
+    ]
+    invalid = [
+        {**product("3", "Top", "Black"), "rating": 5.0, "price_inr": 5000},
+        {**product("4", "Bottom", "Orange"), "rating": 5.0, "price_inr": 5000},
+    ]
+    ranked = rank_outfits(
+        [invalid, valid],
+        ("Top", "Bottom"),
+        budget_inr=2500,
+        occasion="College",
+    )
+    assert ranked[0][1].eligibility_status == "ELIGIBLE"
+    assert ranked[1][1].eligibility_status == "INELIGIBLE"
+    assert ranked[1][1].overall_score == 0
+
+
 def test_workflow_state_has_safe_transition_and_audit_metadata() -> None:
     state = WorkflowState("black and white college outfit")
     state.transition(WorkflowStage.PLANNING, WorkflowStatus.RUNNING)

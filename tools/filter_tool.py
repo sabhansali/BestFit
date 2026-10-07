@@ -5,7 +5,7 @@ from typing import Any, Iterable
 
 def filter_products(
     products: Iterable[dict[str, Any]],
-    budget_inr: float,
+    budget_inr: float | None,
     occasion: str | None = None,
     season: str | None = None,
     gender: str | None = None,
@@ -19,13 +19,13 @@ def filter_products(
     }
     normalized_occasion = occasion_aliases.get(occasion.lower(), occasion.lower()) if occasion else None
     for product in products:
-        if float(product["price_inr"]) > budget_inr:
+        if budget_inr is not None and float(product["price_inr"]) > budget_inr:
             continue
         if occasion and product["occasion"].lower() != normalized_occasion:
             continue
         if season and product["season"].lower() not in {season.lower(), "all season"}:
             continue
-        if gender and product["gender"].lower() != gender.lower():
+        if gender and product["gender"].lower() not in {gender.lower(), "unisex"}:
             continue
         allowed_colors = {color.lower() for color in preferred_colors}
         if preferred_color:

@@ -35,8 +35,8 @@ class WorkflowStatus(str, Enum):
 
 @dataclass(frozen=True)
 class Requirements:
-    budget_inr: float
-    occasion: str
+    budget_inr: float | None
+    occasion: str | None
     required_categories: tuple[str, ...]
     style: str | None = None
     preferred_color: str | None = None
@@ -47,10 +47,8 @@ class Requirements:
     formality: int | None = None
 
     def __post_init__(self) -> None:
-        if self.budget_inr <= 0:
+        if self.budget_inr is not None and self.budget_inr <= 0:
             raise ValueError("Budget must be positive")
-        if not self.occasion.strip():
-            raise ValueError("Occasion is required")
         if not self.required_categories:
             raise ValueError("At least one product category is required")
         if len(set(category.lower() for category in self.required_categories)) != len(
@@ -82,6 +80,7 @@ class WorkflowState:
     outfit_candidates: list[list[dict[str, Any]]] = field(default_factory=list)
     comparison_results: list[dict[str, Any]] = field(default_factory=list)
     ranking_results: list[dict[str, Any]] = field(default_factory=list)
+    rejected_candidates: list[dict[str, Any]] = field(default_factory=list)
     validation_result: dict[str, Any] | None = None
     human_approval: bool | None = None
     messages: list[dict[str, Any]] = field(default_factory=list)
@@ -100,6 +99,10 @@ class WorkflowState:
     validation_checkpoints: list[str] = field(default_factory=list)
     retry_history: list[dict[str, Any]] = field(default_factory=list)
     checkpoint_results: dict[str, dict[str, Any]] = field(default_factory=dict)
+    llm_advice: list[dict[str, Any]] = field(default_factory=list)
+    planner_usage: dict[str, Any] = field(default_factory=dict)
+    human_feedback: dict[str, str] | None = None
+    reanalysis: dict[str, Any] | None = None
 
     def transition(self, stage: WorkflowStage, status: WorkflowStatus) -> None:
         if self.status in {WorkflowStatus.COMPLETED, WorkflowStatus.FAILED}:
@@ -118,7 +121,12 @@ class WorkflowState:
     def record_tool_execution(self) -> None:
         self.tool_execution_count += 1
 
-    def record_human_decision(self, approved: bool) -> None:
+    def record_human_decision(
+        self,
+        approved: bool,
+        feedback_reason: str | None = None,
+        feedback_text: str = "",
+    ) -> None:
         """Commit an approval or reopen the workflow for supervised re-analysis."""
 
         if not (
@@ -127,18 +135,62 @@ class WorkflowState:
         ):
             raise ValueError("Human decision requires a workflow waiting for approval")
         self.human_approval = approved
+        self.human_feedback = (
+            {
+                "reason": feedback_reason or "other",
+                "text": feedback_text.strip(),
+            }
+            if not approved
+            else None
+        )
         if approved:
             self.transition(WorkflowStage.COMPLETED, WorkflowStatus.COMPLETED)
             self.add_trace({"event": "human_approval", "decision": "approved"})
             return
-        self.outfit_candidates.clear()
+        legacy_rejection = feedback_reason is None
+        reason = feedback_reason or "other"
+        rerun_from = {
+            "too_expensive": "ranking",
+            "wrong_color": "ranking",
+            "wrong_style": "ranking",
+            "wrong_occasion": "ranking",
+            "poor_combination": "building",
+            "other": "ranking",
+        }.get(reason, "ranking")
+        skipped = ["security", "planning", "routing", "searching", "filtering"]
+        if rerun_from == "ranking":
+            skipped.append("building")
+        self.reanalysis = {
+            "reason": reason,
+            "feedback": feedback_text.strip(),
+            "rerun_from": "planning" if legacy_rejection else rerun_from,
+            "skipped_stages": skipped,
+            "reexecuted_stages": ["building", "comparing", "ranking", "validating"],
+        }
+        if rerun_from == "building":
+            self.outfit_candidates.clear()
         self.comparison_results.clear()
         self.ranking_results.clear()
+        self.rejected_candidates.clear()
         self.validation_result = None
         self.checkpoint_results.clear()
         self.validation_checkpoints.clear()
-        self.transition(WorkflowStage.PLANNING, WorkflowStatus.RUNNING)
-        self.add_trace({"event": "human_approval", "decision": "rejected", "action": "reanalyze"})
+        self.transition(
+            WorkflowStage.PLANNING
+            if legacy_rejection
+            else (WorkflowStage.BUILDING if rerun_from == "building" else WorkflowStage.RANKING),
+            WorkflowStatus.RUNNING,
+        )
+        self.add_trace(
+            {
+                "event": "human_approval",
+                "decision": "rejected",
+                "action": "targeted_reanalysis",
+                "reason": reason,
+                "rerun_from": rerun_from,
+                "skipped_stages": skipped,
+            }
+        )
 
     def record_retry(self, stage: str, error: str) -> None:
         self.retry_count += 1

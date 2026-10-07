@@ -11,5 +11,6 @@ def execute_query(query: str, mode: str) -> WorkflowState:
     orchestrator = WorkflowOrchestrator(
         create_default_registry(),
         Path(__file__).parents[1] / "data" / "products.csv",
+        use_gemini=True,
     )
     return orchestrator.run(WorkflowState(query), mode=mode)

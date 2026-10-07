@@ -22,14 +22,21 @@ from config import DEFAULT_CONFIG
 from workflow.checkpoints import validate_checkpoint
 from workflow.synchronization import synchronize_search_results
 from workflow.state import WorkflowStage, WorkflowState, WorkflowStatus
+from services.gemini_advisor import review_outfit
 
 
 class WorkflowOrchestrator:
     """Coordinates agents without embedding business logic in the UI."""
 
-    def __init__(self, registry: ToolRegistry, catalog_path: str | Path) -> None:
+    def __init__(
+        self,
+        registry: ToolRegistry,
+        catalog_path: str | Path,
+        use_gemini: bool = False,
+    ) -> None:
         self.registry = registry
         self.catalog_path = catalog_path
+        self.use_gemini = use_gemini
 
     def run(self, state: WorkflowState, mode: str = "parallel") -> WorkflowState:
         if mode not in {"sequential", "parallel"}:
@@ -80,6 +87,7 @@ class WorkflowOrchestrator:
         ComparisonAgent(self.registry).execute(state)
         RankingAgent(self.registry).execute(state)
         validate_checkpoint(state, "ranking")
+        self._add_advisory_reviews(state)
         ValidatorAgent(self.registry).execute(state)
         SupervisorAgent(self.registry).execute(state)
         state.metrics["experimental_cost_units"] = (
@@ -88,6 +96,35 @@ class WorkflowOrchestrator:
             + state.retry_count * DEFAULT_CONFIG.retry_cost_units
         )
         return state
+
+    def _add_advisory_reviews(self, state: WorkflowState) -> None:
+        """Ask Gemini for bounded explanations without changing deterministic results."""
+
+        if not self.use_gemini or state.requirements is None:
+            return
+        requirements = {
+            "budget_inr": state.requirements.budget_inr,
+            "occasion": state.requirements.occasion,
+            "categories": state.requirements.required_categories,
+            "style": state.requirements.style,
+            "colors": state.requirements.preferred_colors,
+            "season": state.requirements.season,
+        }
+        for result in state.ranking_results[:3]:
+            if result.get("eligibility_status") != "ELIGIBLE":
+                continue
+            advice = review_outfit(result["outfit"], requirements)
+            result["gemini_advice"] = advice
+            state.llm_advice.append(
+                {"rank": result["rank"], "status": advice.get("status", "UNAVAILABLE")}
+            )
+        state.add_trace(
+            {
+                "event": "advisory_review_completed",
+                "provider": "gemini",
+                "reviewed": len(state.llm_advice),
+            }
+        )
 
     def _search_with_retry(
         self, search_agent: SearchAgent, state: WorkflowState, category: str

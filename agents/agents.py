@@ -11,6 +11,7 @@ from config import DEFAULT_CONFIG
 from security.guardrails import validate_user_query
 from security.state_validation import validate_state_update
 from tools.registry import ToolRegistry
+from services.gemini_advisor import extract_query_entities, gemini_configured
 from workflow.state import (
     Plan,
     Requirements,
@@ -39,6 +40,39 @@ def _extract_budget(query: str) -> float | None:
     return float(match.group(1).replace(",", "")) if match else None
 
 
+def _normalize_intent(query: str) -> str:
+    """Normalize common misspellings and natural-language intent phrases."""
+
+    normalized = query.casefold()
+    replacements = {
+        "summery": "summer",
+        "sumer": "summer",
+        "hot weather": "summer",
+        "summertime": "summer",
+        "warm weather": "summer",
+        "sunny weather": "summer",
+        "cold weather": "winter",
+        "chilly weather": "winter",
+        "rainy weather": "monsoon",
+        "rainy season": "monsoon",
+        "rainy weather": "monsoon",
+        "cold season": "winter",
+        "male": "men",
+        "female": "women",
+        "everyday dress": "casual dress",
+        "campus wear": "college",
+        "campus outfit": "college outfit",
+        "workwear": "office",
+        "work wear": "office",
+        "evening party": "party",
+        "night party": "party",
+        "business casual": "smart casual",
+    }
+    for source, replacement in replacements.items():
+        normalized = normalized.replace(source, replacement)
+    return normalized
+
+
 class PlannerAgent(Agent):
     name = "planner_agent"
     role = "planner_agent"
@@ -49,30 +83,79 @@ class PlannerAgent(Agent):
             state.security_events.extend({"event": "blocked_input", "finding": item} for item in findings)
             state.transition(WorkflowStage.SECURITY, WorkflowStatus.FAILED)
             raise ValueError("User query blocked by input guardrails")
-        query = state.user_query
-        budget = _extract_budget(query) or DEFAULT_CONFIG.default_budget_inr
+        query = _normalize_intent(state.user_query)
+        llm_entities: dict[str, Any] = {}
+        if gemini_configured():
+            extraction = extract_query_entities(state.user_query, timeout_seconds=2.0)
+            state.planner_usage = {
+                "provider": "Gemini",
+                "configured_model": extraction.get("model")
+                or "GEMINI_MODEL/default",
+                "configured": True,
+                "call_attempted": extraction.get("call_attempted", True),
+                "call_succeeded": extraction.get("call_succeeded", False),
+                "call_status": extraction.get("status", "UNAVAILABLE"),
+                "fallback_used": extraction.get("status") != "AVAILABLE",
+                "latency_ms": extraction.get("latency_ms"),
+                "failure_type": extraction.get("failure_type"),
+                "failure_message": extraction.get("failure_message"),
+            }
+            if extraction.get("status") == "AVAILABLE":
+                llm_entities = extraction
+            state.llm_advice.append(
+                {"type": "entity_extraction", "status": extraction.get("status")}
+            )
+        else:
+            state.planner_usage = {
+                "provider": "Gemini",
+                "configured_model": None,
+                "configured": False,
+                "call_attempted": False,
+                "call_succeeded": False,
+                "call_status": "NOT_CONFIGURED",
+                "fallback_used": True,
+                "latency_ms": 0.0,
+                "failure_type": "configuration",
+                "failure_message": "GEMINI_API_KEY is not configured",
+            }
+        budget = _extract_budget(query)
         category_aliases = {
             "top": "Top", "shirt": "Top", "blouse": "Top", "t-shirt": "Top",
             "bottom": "Bottom", "trouser": "Bottom", "trousers": "Bottom",
-            "pants": "Bottom", "jeans": "Bottom", "footwear": "Footwear",
-            "shoes": "Footwear", "shoe": "Footwear", "accessory": "Accessory",
-            "accessories": "Accessory", "dress": "Dress", "outerwear": "Outerwear",
+            "pants": "Bottom", "jeans": "Bottom",             "footwear": "Footwear", "shoe": "Footwear", "shoes": "Footwear",
+            "accessory": "Accessory",
+            "accessories": "Accessory", "dress": "Dress", "dresses": "Dress",
+            "outerwear": "Outerwear",
             "jacket": "Outerwear",
         }
         categories = tuple(
             category for alias, category in category_aliases.items()
             if re.search(rf"\b{re.escape(alias)}\b", query, re.IGNORECASE)
         )
-        categories = tuple(dict.fromkeys(categories)) or ("Top", "Bottom", "Footwear")
+        llm_categories = {
+            str(value).strip().title()
+            for value in (llm_entities.get("categories") or [])
+            if str(value).strip().title()
+            in {"Top", "Bottom", "Footwear", "Accessory", "Dress", "Outerwear"}
+        }
+        categories = tuple(dict.fromkeys(categories or tuple(llm_categories))) or (
+            "Top", "Bottom", "Footwear"
+        )
         occasion = next(
             (
                 value
-                for value in ("college", "farewell", "party", "office", "wedding", "casual")
+                for value in ("college", "farewell", "party", "office", "wedding")
                 if re.search(rf"\b{value}\b", query, re.IGNORECASE)
             ),
-            "college",
+            str(llm_entities.get("occasion")).casefold()
+            if llm_entities.get("occasion")
+            else None,
         )
-        occasion = {"casual": "casual outing"}.get(occasion, occasion)
+        valid_occasions = {
+            "college", "farewell", "party", "office", "wedding"
+        }
+        if occasion and occasion.casefold() not in valid_occasions:
+            occasion = None
         colors = tuple(
             dict.fromkeys(
                 re.findall(
@@ -84,17 +167,47 @@ class PlannerAgent(Agent):
         )
         requirements = Requirements(
             budget_inr=budget,
-            occasion=occasion.title(),
+            occasion=occasion.title() if occasion else None,
             required_categories=categories,
-            style=_first_match((r"\b(smart casual|casual|formal|party|sporty)\b",), query),
+            style=(
+                _first_match((r"\b(smart casual|casual|formal|party|sporty)\b",), query)
+                or (
+                    str(llm_entities.get("style")).title()
+                    if llm_entities.get("style") else None
+                )
+            ),
             preferred_color=colors[0].lower() if colors else None,
             preferred_colors=tuple(color.lower() for color in colors),
             hard_color_constraint=bool(
                 re.search(r"\b(must|only|exactly|required)\b", query, re.IGNORECASE)
             ),
-            gender=_first_match((r"\b(men|women|unisex)\b",), query),
-            season=_first_match((r"\b(summer|winter|monsoon|spring|autumn)\b",), query),
+            gender=(
+                _first_match((r"\b(men|'?s men|women|'?s women|unisex)\b",), query)
+                or (str(llm_entities.get("gender")).title() if llm_entities.get("gender") else None)
+            ),
+            season=(
+                _first_match((r"\b(summer|winter|monsoon|spring|autumn)\b",), query)
+                or (
+                    _normalize_intent(str(llm_entities.get("season"))).lower()
+                    if llm_entities.get("season") else None
+                )
+            ),
         )
+        if requirements.gender:
+            normalized_gender = requirements.gender.casefold().replace("'s ", " ")
+            if normalized_gender in {"men", "women", "unisex"}:
+                requirements = Requirements(
+                    budget_inr=requirements.budget_inr,
+                    occasion=requirements.occasion,
+                    required_categories=requirements.required_categories,
+                    style=requirements.style,
+                    preferred_color=requirements.preferred_color,
+                    preferred_colors=requirements.preferred_colors,
+                    hard_color_constraint=requirements.hard_color_constraint,
+                    gender=normalized_gender.title(),
+                    season=requirements.season,
+                    formality=requirements.formality,
+                )
         valid, errors = validate_state_update(state, requirements)
         if not valid:
             state.security_events.append({"event": "invalid_state_update", "errors": errors})
@@ -192,6 +305,13 @@ class OutfitBuilderAgent(Agent):
             required_categories=state.requirements.required_categories,
             limit=DEFAULT_CONFIG.max_outfit_candidates,
             budget_inr=state.requirements.budget_inr,
+            occasion=state.requirements.occasion,
+            gender=state.requirements.gender,
+            season=state.requirements.season,
+            preferred_colors=state.requirements.preferred_colors,
+            hard_color_constraint=state.requirements.hard_color_constraint,
+            metrics=state.metrics,
+            rejected_candidates=state.rejected_candidates,
         )
 
 
@@ -223,10 +343,30 @@ class RankingAgent(Agent):
             preferred_style=state.requirements.style,
             occasion=state.requirements.occasion,
             season=state.requirements.season,
+            gender=state.requirements.gender,
+            hard_color_constraint=state.requirements.hard_color_constraint,
         )
-        state.ranking_results = [
-            {"outfit": outfit, "score_breakdown": score.as_dict(), "rank": index}
+        ranked_results = [
+            {
+                "outfit": outfit,
+                "score_breakdown": score.as_dict(),
+                "eligibility_status": score.eligibility_status,
+                "validation_errors": list(score.validation_errors),
+                "validation_warnings": list(score.validation_warnings),
+                "quality_score": score.product_quality,
+                "preference_match": score.preference_match,
+                "outfit_coherence": score.outfit_coherence,
+                "rank": index,
+            }
             for index, (outfit, score) in enumerate(ranked, start=1)
+        ]
+        state.rejected_candidates.extend([
+            result for result in ranked_results
+            if result["eligibility_status"] != "ELIGIBLE"
+        ])
+        state.ranking_results = [
+            result for result in ranked_results
+            if result["eligibility_status"] == "ELIGIBLE"
         ]
 
 
@@ -244,21 +384,27 @@ class ValidatorAgent(Agent):
                 "warnings": [], "checks": {},
             }
         else:
-            checks = [
-                self.call_tool(
-                    state, "validate_recommendation",
-                    outfit=result["outfit"],
-                    budget_inr=state.requirements.budget_inr,
-                    required_categories=state.requirements.required_categories,
-                )
-                for result in state.ranking_results
-            ]
+            checkpoint_results = state.ranking_results[:5]
+            checks = self.call_tool(
+                state, "validate_recommendation",
+                outfits=[result["outfit"] for result in checkpoint_results],
+                budget_inr=state.requirements.budget_inr,
+                required_categories=state.requirements.required_categories,
+                occasion=state.requirements.occasion,
+                gender=state.requirements.gender,
+                season=state.requirements.season,
+                preferred_colors=state.requirements.preferred_colors,
+                hard_color_constraint=state.requirements.hard_color_constraint,
+            )
             errors = [error for result in checks for error in result["errors"]]
             state.validation_result = {
                 "status": "PASSED" if not errors else "FAILED",
                 "errors": sorted(set(errors)),
                 "warnings": [],
-                "checks": {"candidates_checked": len(checks)},
+                "checks": {
+                    "candidates_checked": len(checks),
+                    "checkpoint": "top_5_ranked_recommendations",
+                },
             }
         state.validation_checkpoints.append("ranking")
 
